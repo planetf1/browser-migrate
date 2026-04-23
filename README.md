@@ -1,8 +1,10 @@
 # browser-migrate
 
+> **Personal, unpolished scripts.** I wrote these to test whether Safari was a viable daily driver by importing my Edge browsing history. They are not a polished tool — no error recovery, no tests, no packaging. Use at your own risk.
+
 Python scripts to export Microsoft Edge history and bookmarks to **Safari's** native import format on macOS.
 
-> **Note:** This tooling targets Safari, not Chrome/Chromium. If you want to migrate Edge → Chrome/Chrome Dev, use Chrome's built-in importer: `Settings → Import bookmarks and settings → Microsoft Edge`.
+> **Note:** This tooling targets Safari only, not Chrome/Chromium. If you want to migrate Edge → Chrome/Chrome Dev, use Chrome's built-in importer: `Settings → Import bookmarks and settings → Microsoft Edge`.
 
 ## What it does
 
