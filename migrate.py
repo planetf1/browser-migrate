@@ -224,11 +224,30 @@ def _merge_bm_folder(src: dict, dst: dict, existing: set[str], counter: list[int
     return added
 
 
+def _empty_bookmarks() -> dict:
+    def _folder(name: str, fid: str) -> dict:
+        return {"children": [], "date_added": "0", "date_last_used": "0",
+                "date_modified": "0", "guid": str(uuid.uuid4()), "id": fid,
+                "name": name, "type": "folder"}
+    return {
+        "checksum": "",
+        "roots": {
+            "bookmark_bar": _folder("Bookmarks bar", "1"),
+            "other": _folder("Other bookmarks", "2"),
+            "synced": _folder("Mobile bookmarks", "3"),
+        },
+        "version": 1,
+    }
+
+
 def merge_bookmarks(src_path: str, dst_path: str) -> int:
     with open(src_path, "r", encoding="utf-8") as f:
         src = json.load(f)
-    with open(dst_path, "r", encoding="utf-8") as f:
-        dst = json.load(f)
+    if not os.path.exists(dst_path):
+        dst = _empty_bookmarks()
+    else:
+        with open(dst_path, "r", encoding="utf-8") as f:
+            dst = json.load(f)
 
     existing: set[str] = set()
     max_id = 0
@@ -367,12 +386,11 @@ def main() -> int:
     for src in sources:
         if not os.path.exists(src["bookmarks_path"]):
             continue
-        if not os.path.exists(target["bookmarks_path"]):
-            continue
         if src["bookmarks_path"] == target["bookmarks_path"]:
             continue
         if not bm_backed_up:
-            _backup(target["bookmarks_path"])
+            if os.path.exists(target["bookmarks_path"]):
+                _backup(target["bookmarks_path"])
             bm_backed_up = True
         bm_added += merge_bookmarks(src["bookmarks_path"], target["bookmarks_path"])
     if bm_added:
