@@ -57,7 +57,8 @@ def get_edge_profiles() -> list[dict]:
             if not os.path.isdir(full_path) or not os.path.exists(history_path):
                 continue
             name, email = _read_prefs_display_name(os.path.join(full_path, "Preferences"), item)
-            display = f"Edge {channel} - {name}"
+            suffix = f" [{item}]" if name != item else ""
+            display = f"Edge {channel} - {name}{suffix}"
             if email:
                 display += f" ({email})"
             profiles.append({"name": display, "history_path": history_path})
@@ -77,7 +78,8 @@ def get_chrome_profiles() -> list[dict]:
             if not os.path.isdir(full_path) or not os.path.exists(history_path):
                 continue
             name, _ = _read_prefs_display_name(os.path.join(full_path, "Preferences"), item)
-            profiles.append({"name": f"{browser_name} - {name}", "history_path": history_path})
+            suffix = f" [{item}]" if name != item else ""
+            profiles.append({"name": f"{browser_name} - {name}{suffix}", "history_path": history_path})
     return profiles
 
 
