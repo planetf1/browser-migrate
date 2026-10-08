@@ -2,7 +2,11 @@
 *.json
 *.html
 *.sqlite
+*.zip
 temp_*.sqlite
+# Timestamped-suffixed renames of the above (break the extension patterns)
+History_*.json*
+Bookmarks_*.html*
 
 # Python
 __pycache__/
@@ -15,3 +19,6 @@ build/
 
 # macOS
 .DS_Store
+
+# Agent tooling scratch
+.commandcode/

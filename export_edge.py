@@ -22,6 +22,7 @@ Produces Safari's importable History.json format:
 import sqlite3
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -37,6 +38,23 @@ EDGE_ROOTS = [
 
 # Chromium/Edge epoch (1601) → Unix (1970) conversion in microseconds
 EPOCH_DIFF_USEC = 11644473600 * 1_000_000
+
+
+def _clean_filename_part(part: str) -> str:
+    """Reduce a string to filesystem-safe characters (alnum, @, ., -)."""
+    return re.sub(r"[^A-Za-z0-9@.\-]+", "_", part).strip("_")
+
+
+def _build_safe_filename(channel_name: str, friendly_name: str, email: str) -> str:
+    """
+    Build the output filename from the same parts shown in the profile list:
+    channel + profile name as displayed in Edge + account email when known,
+    e.g. `Microsoft_Edge_Beta_Profile_2_jonesn@uk.ibm.com`.
+    """
+    parts = [_clean_filename_part(channel_name), _clean_filename_part(friendly_name)]
+    if email:
+        parts.append(_clean_filename_part(email))
+    return "_".join(p for p in parts if p)
 
 
 def get_channel_name_from_root(root_path: str) -> str:
@@ -83,6 +101,7 @@ def get_profiles():
     A profile is any directory under the root that contains a 'History' DB.
     """
     profiles = []
+    seen_filenames = set()
     for root in EDGE_ROOTS:
         if not os.path.exists(root):
             continue
@@ -96,29 +115,37 @@ def get_profiles():
             prefs_path = os.path.join(full_path, "Preferences")
 
             if os.path.isdir(full_path) and os.path.exists(history_path):
-                display_name = f"{channel_name} - {item}"
-                # Try to get friendly profile name (e.g., "Personal", "Work")
+                # Friendly name + email are what Edge shows in the profile list;
+                # the raw dir name (`item`) can disagree after renames/reshuffles.
+                friendly_name = item
+                email = ""
                 if os.path.exists(prefs_path):
                     try:
                         with open(prefs_path, "r", encoding="utf-8") as f:
                             prefs = json.load(f)
-                        name = prefs.get("profile", {}).get("name", item)
-                        email = ""
+                        friendly_name = prefs.get("profile", {}).get("name", item) or item
                         acc_info = prefs.get("account_info")
                         if isinstance(acc_info, list) and acc_info:
-                            email = acc_info[0].get("email", "")
-                        if email:
-                            display_name = f"{channel_name} - {name} ({email})"
-                        else:
-                            display_name = f"{channel_name} - {name}"
+                            email = acc_info[0].get("email", "") or ""
                     except Exception:
                         pass
+
+                display_name = f"{channel_name} - {friendly_name}"
+                if email:
+                    display_name = f"{display_name} ({email})"
+
+                # Filename mirrors the display name so work/personal are obvious
+                # at a glance, e.g. History_Microsoft_Edge_Beta_Profile_2_jonesn@uk.ibm.com.json
+                safe_filename = _build_safe_filename(channel_name, friendly_name, email)
+                if safe_filename in seen_filenames:
+                    safe_filename = f"{safe_filename}_{_clean_filename_part(item)}"
+                seen_filenames.add(safe_filename)
 
                 profiles.append({
                     "id": f"{channel_name}_{item}",
                     "name": display_name,
                     "history_path": history_path,
-                    "safe_filename": f"{channel_name}_{item}".replace(" ", "_"),
+                    "safe_filename": safe_filename,
                     "channel_root": root,
                     "channel_name": channel_name,
                     "channel_version": channel_version,

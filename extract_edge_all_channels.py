@@ -60,10 +60,12 @@ def extract_history(profile):
         print(f"   [History] ⚠️  No History DB found.")
         return None
 
-    # Filename includes Channel (Dev/Stable) to avoid confusion
+    # Filename includes Channel (Dev/Stable) to avoid confusion.
+    # NOTE: this is a RAW dump, NOT Safari's import format — the "HistoryRaw_"
+    # prefix keeps it from being mistaken for export_edge.py's importable output.
     safe_name = "".join([c for c in profile['name'] if c.isalnum() or c in (' ', '-', '_')]).strip()
     safe_channel = profile['channel'].replace(" ", "_")
-    output_filename = f"History_{safe_channel}_{safe_name.replace(' ', '_')}.json"
+    output_filename = f"HistoryRaw_{safe_channel}_{safe_name.replace(' ', '_')}.json"
     temp_db = f"temp_history_{profile['folder']}.sqlite"
 
     shutil.copy2(profile['history_path'], temp_db)
@@ -103,7 +105,7 @@ def extract_history(profile):
         with open(output_filename, 'w', encoding='utf-8') as f:
             json.dump(final_json, f, indent=2)
 
-        print(f"   [History] ✅ Extracted {len(history_items)} items (Raw DB: {total_raw}) -> {output_filename}")
+        print(f"   [History] ✅ Raw dump (NOT Safari-importable) {len(history_items)} items (Raw DB: {total_raw}) -> {output_filename}")
         return output_filename
 
     except Exception as e:
@@ -191,6 +193,10 @@ def main():
         print(f"\n--- Processing: {p['name']} ({p['channel']}) ---")
         extract_history(p)
         extract_bookmarks(p)
+
+    print("\n--- Next Step ---")
+    print("Bookmarks:  in Safari (matching profile) → File → Import From → Bookmarks HTML File…")
+    print("History:    HistoryRaw_*.json is a backup dump only — use export_edge.py for Safari.")
 
 if __name__ == "__main__":
     main()
