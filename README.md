@@ -225,6 +225,50 @@ HTML reconciliation described in the `macos-safari-migration` skill.
 
 ---
 
+## Usage: Safari → Edge (reverse pull)
+
+After a stint in Safari, pull the Safari-native browsing back into Edge
+Beta, per profile (personal → `Default`, work → `Profile 1`; every write
+is preceded by an account-email verification against the target profile's
+`Preferences`, and the quit-guard matches the Edge **Beta** bundle path —
+Teams' embedded Edge WebView2 helpers false-positive a naive name check).
+
+```bash
+uv run safari_to_edge.py --since 2026-10-08 --apply        # history
+uv run safari_to_edge_bookmarks.py --apply                 # bookmarks
+```
+
+- **History** dedupes on `(url, visit_time ± 2 µs)`: the forward import
+  stored Edge's integer µs as Cocoa REAL seconds, and the double
+  round-trip drifts 1–2 µs, so exact-integer matching would re-insert
+  ~half the migrated rows as near-duplicates. Inserted visits are
+  local-only — Edge's own history sync does not replay raw DB rows.
+- **Bookmarks** land under a single reversible `From Safari` folder in
+  each profile's `other` root: insert-only, URL-dedupe against the whole
+  target profile, existing Edge nodes never touched. Reading List and the
+  `Edge Workspaces/` subtree are excluded by design. Unlike history,
+  bookmark-file edits DO propagate through Edge's own sync to other
+  devices.
+
+### Bookmark cleanup across profile stores
+
+```bash
+uv run brm.py stores              # leaf + duplicate counts per store
+uv run brm.py dedupe              # canonical-URL dedupe, dry run
+uv run brm.py dedupe --apply      # removes losers, prunes empty folders
+```
+
+`brmlib.py` is the shared store model — canonicaliser, Safari plist /
+Edge JSON adapters, browser-quit guards, timestamped backups. Stores:
+`safari-personal`, `safari-work` (the `Work/` subtree — the only place the
+work/personal boundary needs code enforcement), `edge-personal`,
+`edge-work`. Canonical keys strip tracking params and normalise
+scheme/host/`www`/trailing slash (`http://x` and `https://www.x/` count
+as one bookmark); winners keep their stored URL — only duplicate losers
+are deleted, nothing is ever rewritten.
+
+---
+
 ## Safari iCloud history sync — how it actually works (macOS 27)
 
 Empirically reverse-engineered 2026-10-08 after imports silently failed to
@@ -303,6 +347,10 @@ A browser's `History` and `Web Data` SQLite files are locked while the browser i
 | `dedupe_bookmarks.py` | Reading List stray repair + priority-aware bookmark dedupe + seeded-defaults strip |
 | `reorganise_bookmarks.py` | Top-level reorganisation into scheme folders (September 2026) |
 | `categorise_bookmarks.py` | URL classification ruleset used by the above |
+| `safari_to_edge.py` | Reverse history pull: Safari profile DBs → Edge Beta History DBs (±2 µs tolerance dedupe, `--since` filter) |
+| `safari_to_edge_bookmarks.py` | Reverse bookmark pull into a reversible `From Safari` folder per Edge profile |
+| `brm.py` | Bookmark CLI over the four profile stores: `stores`, `dedupe` |
+| `brmlib.py` | Shared store model: canonicaliser, Safari/Edge adapters, quit-guards, backups |
 | `final.py` | Alternative Safari export using per-visit rows |
 | `extract_edge_all_channels.py` | Scans all installed Edge channels |
 | `extract_edge_multiprofile.py` | Multi-profile extraction |
