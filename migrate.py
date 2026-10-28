@@ -166,9 +166,12 @@ def get_safari_profiles() -> list[dict]:
 # ── Role classification (runtime, nothing hardcoded) ──────────────────────────
 
 def classify_roles(profiles: list[dict]) -> None:
+    hdr("Profiles")
+    for i, p in enumerate(profiles, 1):
+        print(f"  [{i}] {p['name']}")
     hdr("Roles")
     print("Which profiles are WORK? Everything else is personal.")
-    ans = input("Work profiles (numbers, Enter for none): ").strip()
+    ans = input("Work profiles (numbers, or Enter for none): ").strip()
     work: set[int] = set()
     for tok in ans.replace(",", " ").split():
         try:
@@ -192,7 +195,7 @@ def classify_roles(profiles: list[dict]) -> None:
 def pick_sources(profiles: list[dict]) -> list[dict]:
     hdr("Source")
     for i, p in enumerate(profiles, 1):
-        print(f"  [{i}] {p['name']}")
+        print(f"  [{i}] {p['name']}  ·  {p['role']}")
     ans = input("Profiles (numbers, or all): ").strip().lower()
     if ans == "all":
         return list(profiles)
@@ -232,7 +235,8 @@ def pick_target(profiles: list[dict], sources: list[dict]) -> dict:
 
     hdr("Target")
     for i, p in enumerate(entries, 1):
-        print(f"  [{i}] {p['name']}")
+        label = p["name"] if p["kind"] == "group" else f"{p['name']}  ·  {p['role']}"
+        print(f"  [{i}] {label}")
     ans = input("Target (number): ").strip()
     try:
         idx = int(ans) - 1

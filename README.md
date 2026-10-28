@@ -58,9 +58,15 @@ personal. Profiles sharing an account email inherit the same role.
 Nothing is hardcoded: no UUIDs, no emails in the source.
 
 ```text
+── Profiles ────────────────────────────────────────
+  [1] Microsoft Edge Beta — Profile 1 [Default] (nigel@cherrybyte.me.uk)
+  [2] Microsoft Edge Beta — Profile 2 [Profile 1] (jonesn@uk.ibm.com)
+  …
+  [8] Safari — 1B5279A1
+
 ── Roles ───────────────────────────────────────────
 Which profiles are WORK? Everything else is personal.
-Work profiles (numbers, Enter for none): 2 8
+Work profiles (numbers, or Enter for none): 2 8
   work      Microsoft Edge Beta — Profile 2 [Profile 1] (jonesn@uk.ibm.com), Safari — 1B5279A1
   personal  Microsoft Edge Beta — Profile 1 [Default] (nigel@cherrybyte.me.uk), …
 ```
