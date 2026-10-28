@@ -1,27 +1,44 @@
 #!/usr/bin/env python3
 """
-Migrate browsing data between any Chromium-based browsers on macOS.
-Works in any direction: Edge ↔ Chrome, Chrome ↔ Brave, etc.
+migrate.py — unified browser data migration on macOS.
 
-Migrates (all with deduplication):
-  - History    (SQLite History DB — URLs + individual visits)
-  - Bookmarks  (JSON Bookmarks file — folder structure preserved)
-  - Autofill   (SQLite Web Data — form field values only)
+Chromium ↔ Chromium ↔ Safari, per profile, in one interactive flow.
 
-Not migrated (encrypted with browser-specific OS keychain keys):
-  - Saved passwords  (Login Data)
-  - Credit cards     (Web Data)
+  History    Chromium SQLite ↔ Safari History.db (Cocoa conversion,
+             generation-stamped so rows reach iCloud history sync)
+  Bookmarks  Chromium JSON ↔ Safari shared Bookmarks.plist
+  Autofill   Chromium ↔ Chromium only (Safari has no accessible store)
 
-The target browser MUST be fully closed before running.
+Work/personal roles are classified at run time (nothing hardcoded) and
+routing insists work → work, personal → personal. Cross-role routing is
+refused unless --allow-cross-role is given.
+
+Dry run by default: the tool plans against read-only snapshots and writes
+nothing until --apply. Sources are always read from snapshots and may stay
+open; the target browser must be quit for --apply (checked automatically).
+
+Usage:
+  uv run migrate.py                     # plan only
+  uv run migrate.py --apply             # write (with backups)
+  uv run migrate.py --apply --allow-cross-role
 """
 
+import argparse
 import json
 import os
+import plistlib
 import shutil
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import time
 import uuid
+
+from direct_import_safari import import_items
+from safari_to_edge import merge_into_edge, read_safari_visits, snapshot
+from safari_to_edge_bookmarks import collect_safari_leaves, pull_into_chromium
+from sync_edge_bookmarks import run_sync
 
 ALL_BROWSER_ROOTS: list[tuple[str, str]] = [
     ("Microsoft Edge",        os.path.expanduser("~/Library/Application Support/Microsoft Edge")),
@@ -36,6 +53,39 @@ ALL_BROWSER_ROOTS: list[tuple[str, str]] = [
     ("Brave",                 os.path.expanduser("~/Library/Application Support/BraveSoftware/Brave-Browser")),
     ("Vivaldi",               os.path.expanduser("~/Library/Application Support/Vivaldi")),
 ]
+
+# Bundle names for the target-quit guard (matched against the full .app
+# path so embedded WebView helpers from other apps never false-positive).
+BROWSER_BUNDLES = {
+    "Microsoft Edge": "Microsoft Edge.app",
+    "Microsoft Edge Dev": "Microsoft Edge Dev.app",
+    "Microsoft Edge Beta": "Microsoft Edge Beta.app",
+    "Microsoft Edge Canary": "Microsoft Edge Canary.app",
+    "Google Chrome": "Google Chrome.app",
+    "Google Chrome Dev": "Google Chrome Dev.app",
+    "Google Chrome Beta": "Google Chrome Beta.app",
+    "Google Chrome Canary": "Google Chrome Canary.app",
+    "Chromium": "Chromium.app",
+    "Brave": "Brave Browser.app",
+    "Vivaldi": "Vivaldi.app",
+}
+
+SAFARI_DEFAULT_DIR = os.path.expanduser("~/Library/Safari")
+SAFARI_PROFILES_BASE = os.path.expanduser(
+    "~/Library/Containers/com.apple.Safari/Data/Library/Safari/Profiles")
+SAFARI_PLIST = os.path.expanduser("~/Library/Safari/Bookmarks.plist")
+
+# Chromium stores µs since 1601-01-01; Safari Cocoa seconds since 2001-01-01.
+CHROMIUM_TO_COCOA = 11_644_473_600 + 978_307_200
+
+
+def die(msg: str) -> None:
+    print(f"\n❌ {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def hdr(title: str) -> None:
+    print(f"\n── {title} " + "─" * max(0, 56 - len(title)))
 
 
 # ── Profile detection ──────────────────────────────────────────────────────────
@@ -52,7 +102,7 @@ def _read_prefs(prefs_path: str, fallback: str) -> tuple[str, str]:
         return fallback, ""
 
 
-def get_all_profiles() -> list[dict]:
+def get_chromium_profiles() -> list[dict]:
     profiles = []
     for browser_name, root in ALL_BROWSER_ROOTS:
         if not os.path.exists(root):
@@ -66,16 +116,211 @@ def get_all_profiles() -> list[dict]:
                 continue
             name, email = _read_prefs(os.path.join(full_path, "Preferences"), item)
             suffix = f" [{item}]" if name != item else ""
-            display = f"{browser_name} - {name}{suffix}"
+            display = f"{browser_name} — {name}{suffix}"
             if email:
                 display += f" ({email})"
             profiles.append({
+                "kind": "chromium",
+                "browser": browser_name,
+                "email": email,
                 "name": display,
                 "history_path": history_path,
                 "bookmarks_path": os.path.join(full_path, "Bookmarks"),
                 "web_data_path": os.path.join(full_path, "Web Data"),
+                "profile_dir": full_path,
             })
     return profiles
+
+
+def get_safari_profiles() -> list[dict]:
+    profiles = []
+    if os.path.exists(os.path.join(SAFARI_DEFAULT_DIR, "History.db")):
+        profiles.append({
+            "kind": "safari",
+            "browser": "Safari",
+            "email": "",
+            "name": "Safari — default (~/Library/Safari)",
+            "history_path": os.path.join(SAFARI_DEFAULT_DIR, "History.db"),
+            "bookmarks_path": SAFARI_PLIST,
+            "web_data_path": None,
+            "profile_dir": SAFARI_DEFAULT_DIR,
+        })
+    if os.path.isdir(SAFARI_PROFILES_BASE):
+        for item in sorted(os.listdir(SAFARI_PROFILES_BASE)):
+            full = os.path.join(SAFARI_PROFILES_BASE, item)
+            if not os.path.exists(os.path.join(full, "History.db")):
+                continue  # companion profiles without history
+            profiles.append({
+                "kind": "safari",
+                "browser": "Safari",
+                "email": "",
+                "name": f"Safari — {item.split('-')[0]}",
+                "history_path": os.path.join(full, "History.db"),
+                "bookmarks_path": SAFARI_PLIST,
+                "web_data_path": None,
+                "profile_dir": full,
+            })
+    return profiles
+
+
+# ── Role classification (runtime, nothing hardcoded) ──────────────────────────
+
+def classify_roles(profiles: list[dict]) -> None:
+    hdr("Roles")
+    print("Which profiles are WORK? Everything else is personal.")
+    ans = input("Work profiles (numbers, Enter for none): ").strip()
+    work: set[int] = set()
+    for tok in ans.replace(",", " ").split():
+        try:
+            work.add(int(tok))
+        except ValueError:
+            die(f"not a profile number: {tok!r}")
+    for i, p in enumerate(profiles, 1):
+        p["role"] = "work" if i in work else "personal"
+    # Same email ⇒ same role, across browsers.
+    work_emails = {p["email"] for p in profiles if p["role"] == "work" and p["email"]}
+    for p in profiles:
+        if p["email"] and p["email"] in work_emails:
+            p["role"] = "work"
+    for role in ("work", "personal"):
+        names = [p["name"] for p in profiles if p["role"] == role]
+        print(f"  {role:9} {', '.join(names) if names else '(none)'}")
+
+
+# ── Selection UI ───────────────────────────────────────────────────────────────
+
+def pick_sources(profiles: list[dict]) -> list[dict]:
+    hdr("Source")
+    for i, p in enumerate(profiles, 1):
+        print(f"  [{i}] {p['name']}")
+    ans = input("Profiles (numbers, or all): ").strip().lower()
+    if ans == "all":
+        return list(profiles)
+    picked = []
+    for tok in ans.replace(",", " ").split():
+        try:
+            idx = int(tok) - 1
+        except ValueError:
+            die(f"not a profile number: {tok!r}")
+        if not 0 <= idx < len(profiles):
+            die(f"no profile number {tok}")
+        picked.append(profiles[idx])
+    if not picked:
+        die("no source selected")
+    return picked
+
+
+def pick_target(profiles: list[dict], sources: list[dict]) -> dict:
+    """Individual profiles plus, where useful, role-routed group targets."""
+    src_ids = {id(s) for s in sources}
+    entries: list[dict] = [p for p in profiles if id(p) not in src_ids]
+
+    # One group entry per browser when ≥2 targettable profiles remain, so a
+    # single run can route both roles at once.
+    by_browser: dict[str, list[dict]] = {}
+    for p in profiles:
+        if id(p) not in src_ids:
+            by_browser.setdefault(p["browser"], []).append(p)
+    for browser, ps in sorted(by_browser.items()):
+        if len(ps) >= 2:
+            entries.append({
+                "kind": "group",
+                "browser": browser,
+                "name": f"{browser} — all profiles (routed by role)",
+                "profiles": ps,
+            })
+
+    hdr("Target")
+    for i, p in enumerate(entries, 1):
+        print(f"  [{i}] {p['name']}")
+    ans = input("Target (number): ").strip()
+    try:
+        idx = int(ans) - 1
+    except ValueError:
+        die(f"not a target number: {ans!r}")
+    if not 0 <= idx < len(entries):
+        die(f"no target number {ans}")
+    return entries[idx]
+
+
+def resolve_routes(sources: list[dict], target: dict,
+                   allow_cross: bool) -> list[tuple[dict, dict]]:
+    """Pair each source with its target profile, insisting role-to-role."""
+    if target["kind"] == "group":
+        routes: list[tuple[dict, dict]] = []
+        unrouted = []
+        for s in sources:
+            if any(s is t for t in target["profiles"]):
+                continue  # self
+            match = next((t for t in target["profiles"] if t["role"] == s["role"]), None)
+            if match is None:
+                unrouted.append(s)
+            else:
+                routes.append((s, match))
+        if unrouted:
+            roles = " + ".join(sorted({s["role"] for s in unrouted}))
+            die(f"no {roles} profile in the target group for: "
+                + ", ".join(s["name"] for s in unrouted)
+                + ". Classify a matching target profile, or deselect these sources.")
+        return routes
+
+    conflicts = [s for s in sources if s["role"] != target["role"]]
+    if conflicts:
+        if not allow_cross:
+            die("cross-role routing refused: "
+                + ", ".join(s["name"] for s in conflicts)
+                + f" would land in the {target['role']} target '{target['name']}'. "
+                  "Pick the matching target, or pass --allow-cross-role.")
+        print("\n  ⚠ cross-role routing allowed for: "
+              + ", ".join(s["name"] for s in conflicts))
+    return [(s, target) for s in sources]
+
+
+# ── Quit guards and backups ────────────────────────────────────────────────────
+
+def browser_running(pattern: str) -> bool:
+    return subprocess.run(["pgrep", "-if", pattern],
+                          capture_output=True).returncode == 0
+
+
+def guard_targets(routes: list[tuple[dict, dict]], safari_plist_write: bool) -> None:
+    """Every browser that will be written must be quit."""
+    names = {t["browser"] for _, t in routes}
+    if safari_plist_write:
+        names.add("Safari")
+    running = []
+    for browser in sorted(names):
+        if browser == "Safari":
+            if subprocess.run(["pgrep", "-x", "Safari"]).returncode == 0:
+                running.append("Safari")
+        elif browser_running(BROWSER_BUNDLES.get(browser, browser + ".app")):
+            running.append(browser)
+    if running:
+        die("target browser still running: " + ", ".join(running)
+            + ". Quit it (⌘Q) and re-run with --apply.")
+
+
+def _backup(path: str) -> None:
+    """Timestamped backup including SQLite sidecar files."""
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    stem = f".migrator-{ts}"
+    n = 1
+    while os.path.exists(f"{path}{stem}.bak"):
+        stem = f".migrator-{ts}-{n}"
+        n += 1
+    for ext in ("", "-wal", "-shm"):
+        if os.path.exists(path + ext):
+            shutil.copy2(path + ext, f"{path}{ext}{stem}.bak")
+    print(f"  Backed up → {os.path.basename(path)}{stem}.bak")
+
+
+def _dst_copy(path: str, tmpdir: str, name: str) -> str:
+    """Dry-run stand-in for a target file: a WAL-aware snapshot copy, or a
+    fresh path when the target file does not exist yet."""
+    dst = os.path.join(tmpdir, name)
+    if os.path.exists(path):
+        snapshot(path, tmpdir, name)
+    return dst
 
 
 # ── History ────────────────────────────────────────────────────────────────────
@@ -158,6 +403,76 @@ def merge_history(src_urls: list, src_visits: list, dst_path: str) -> tuple[int,
     conn.commit()
     conn.close()
     return urls_added, visits_added
+
+
+def chromium_items_for_safari(sources: list[dict]) -> list[tuple[str, str, float]]:
+    """(url, title, cocoa_time) per URL, latest visit wins — the established
+    single-visit-per-item forward shape (matches export/direct-import)."""
+    best: dict[str, tuple[str, float]] = {}
+    for s in sources:
+        urls, _ = read_history(s["history_path"])
+        for url, title, _count, last_visit_time in urls:
+            cocoa = last_visit_time / 1_000_000 - CHROMIUM_TO_COCOA
+            if url in best and best[url][1] >= cocoa:
+                continue
+            best[url] = (title or "", cocoa)
+    return [(url, t, c) for url, (t, c) in best.items()]
+
+
+def migrate_history(routes: list[tuple[dict, dict]], apply: bool,
+                    tmpdir: str) -> list[tuple[str, int]]:
+    """Run every history route; returns [(safari db, stamp)] for verification."""
+    hdr("History")
+    stamps: list[tuple[str, int]] = []
+    by_target: dict[int, tuple[dict, list[dict]]] = {}
+    for s, t in routes:
+        by_target.setdefault(id(t), (t, []))[1].append(s)
+
+    for t, srcs in by_target.values():
+        print(f"\n  → {t['name']}")
+        chrom_srcs = [s for s in srcs if s["kind"] == "chromium"]
+        safari_srcs = [s for s in srcs if s["kind"] == "safari"]
+
+        if t["kind"] == "safari":
+            if safari_srcs:
+                print("  (Safari → Safari history is a no-op; skipped)")
+            if not chrom_srcs:
+                continue
+            items = chromium_items_for_safari(chrom_srcs)
+            inserted, skipped, stamp = import_items(t["history_path"], items, apply)
+            print(f"  History:  +{inserted:,} URLs  ({skipped:,} already present)"
+                  f"{'' if apply else '  (dry run)'}")
+            if stamp:
+                stamps.append((t["history_path"], stamp))
+        else:
+            if chrom_srcs:
+                all_urls: list = []
+                all_visits: list = []
+                for s in chrom_srcs:
+                    urls, visits = read_history(s["history_path"])
+                    all_urls.extend(urls)
+                    all_visits.extend(visits)
+                    print(f"  Read {len(urls):,} URLs, {len(visits):,} visits ← {s['name']}")
+                if apply:
+                    _backup(t["history_path"])
+                    dst = t["history_path"]
+                else:
+                    dst = _dst_copy(t["history_path"], tmpdir, "hist-dst.sqlite")
+                h_urls, h_visits = merge_history(all_urls, all_visits, dst)
+                print(f"  History:  +{h_urls:,} URLs  +{h_visits:,} visits"
+                      f"{'' if apply else '  (dry run)'}")
+            for s in safari_srcs:
+                visits = read_safari_visits(
+                    snapshot(s["history_path"], tmpdir, f"safsrc-{id(s)}.db"))
+                if apply:
+                    _backup(t["history_path"])
+                    dst = t["history_path"]
+                else:
+                    dst = _dst_copy(t["history_path"], tmpdir, f"hist-dst-{id(t)}.sqlite")
+                n_urls, n_visits, _ins = merge_into_edge(dst, visits, apply)
+                print(f"  History:  +{n_urls:,} URLs  +{n_visits:,} visits ← {s['name']}"
+                      f"  (url + visit_time ±2 µs dedupe){'' if apply else '  (dry run)'}")
+    return stamps
 
 
 # ── Bookmarks ──────────────────────────────────────────────────────────────────
@@ -271,6 +586,84 @@ def merge_bookmarks(src_path: str, dst_path: str) -> int:
     return added
 
 
+def _unique(items: list[dict]) -> list[dict]:
+    """Order-preserving dedup for profile dicts (unhashable, id-keyed)."""
+    out: list[dict] = []
+    seen: set[int] = set()
+    for it in items:
+        if id(it) not in seen:
+            seen.add(id(it))
+            out.append(it)
+    return out
+
+
+def migrate_bookmarks(routes: list[tuple[dict, dict]], apply: bool,
+                      tmpdir: str) -> None:
+    hdr("Bookmarks")
+    safari_targets = [t for _, t in routes if t["kind"] == "safari"]
+    chromium_routes = [(s, t) for s, t in routes
+                       if s["kind"] == "chromium" and t["kind"] == "chromium"]
+
+    # Chromium → Safari: curated filing into the shared plist
+    # (personal → scheme folders, work → Work/ subtree).
+    if safari_targets:
+        chrom_srcs = [s for s, _ in routes if s["kind"] == "chromium"]
+        if chrom_srcs:
+            personal = [s["profile_dir"] for s in chrom_srcs if s["role"] == "personal"]
+            work = [s["profile_dir"] for s in chrom_srcs if s["role"] == "work"]
+            print("\n  Chromium → Safari shared plist (curated filing)")
+            run_sync(personal, work, apply)
+        else:
+            print("\n  no Chromium sources; Safari bookmark filing skipped")
+
+    # Safari → Chromium: reversible 'From Safari' inbox per target profile.
+    if any(s["kind"] == "safari" for s, _ in routes):
+        chrom_targets = _unique([t for _, t in routes if t["kind"] == "chromium"])
+        if chrom_targets:
+            plist_snap = os.path.join(tmpdir, "Bookmarks.plist")
+            shutil.copy2(SAFARI_PLIST, plist_snap)
+            try:
+                with open(plist_snap, "rb") as f:
+                    tree = plistlib.load(f)
+            except plistlib.InvalidFileException:
+                die("Bookmarks.plist snapshot failed to parse — is Safari mid-write? "
+                    "Retry, or quit Safari first.")
+            personal_leaves, work_leaves, _excluded = collect_safari_leaves(tree, False)
+            has_work_target = any(t["role"] == "work" for t in chrom_targets)
+            has_personal_target = any(t["role"] == "personal" for t in chrom_targets)
+            for t in chrom_targets:
+                leaves = work_leaves if t["role"] == "work" else personal_leaves
+                if t["role"] == "personal" and work_leaves and not has_work_target:
+                    print(f"\n  ⚠ {len(work_leaves):,} Safari bookmarks in the Work/ zone "
+                          "have no work target in this run — skipped "
+                          "(bookmarks never cross roles)")
+                if t["role"] == "work" and personal_leaves and not has_personal_target:
+                    print(f"\n  ⚠ {len(personal_leaves):,} Safari bookmarks outside Work/ "
+                          "have no personal target in this run — skipped "
+                          "(bookmarks never cross roles)")
+                print(f"\n  Safari shared tree → {t['name']}")
+                pull_into_chromium(leaves, t["bookmarks_path"], apply)
+
+    # Chromium → Chromium: folder-merge into each target profile.
+    if chromium_routes:
+        for t in _unique([t for _, t in chromium_routes]):
+            srcs = [s for s, tt in chromium_routes if tt is t]
+            if apply:
+                if os.path.exists(t["bookmarks_path"]):
+                    _backup(t["bookmarks_path"])
+                dst = t["bookmarks_path"]
+            else:
+                dst = _dst_copy(t["bookmarks_path"], tmpdir, f"bm-dst-{id(t)}.json")
+            added = 0
+            for s in srcs:
+                if not os.path.exists(s["bookmarks_path"]):
+                    continue
+                if s["bookmarks_path"] == t["bookmarks_path"]:
+                    continue
+                added += merge_bookmarks(s["bookmarks_path"], dst)
+            print(f"  {t['name']}:  +{added:,} bookmarks{'' if apply else '  (dry run)'}")
+
+
 # ── Autofill ───────────────────────────────────────────────────────────────────
 
 def merge_autofill(src_web_data: str, dst_web_data: str) -> int:
@@ -312,108 +705,129 @@ def merge_autofill(src_web_data: str, dst_web_data: str) -> int:
     return added
 
 
-# ── UI helpers ─────────────────────────────────────────────────────────────────
+def migrate_autofill(routes: list[tuple[dict, dict]], apply: bool,
+                     tmpdir: str) -> None:
+    hdr("Autofill")
+    if any(s["kind"] == "safari" or t["kind"] == "safari" for s, t in routes):
+        print("  skipped — Safari has no accessible autofill store")
+        return
+    for t in _unique([t for _, t in routes]):
+        srcs = [s for s, tt in routes if tt is t]
+        if not os.path.exists(t["web_data_path"]):
+            print(f"  {t['name']}:  no Web Data store, skipped")
+            continue
+        if apply:
+            _backup(t["web_data_path"])
+            dst = t["web_data_path"]
+        else:
+            dst = _dst_copy(t["web_data_path"], tmpdir, f"wd-dst-{id(t)}.sqlite")
+        added = 0
+        for s in srcs:
+            if not os.path.exists(s["web_data_path"]):
+                continue
+            if s["web_data_path"] == t["web_data_path"]:
+                continue
+            added += merge_autofill(s["web_data_path"], dst)
+        if added:
+            print(f"  {t['name']}:  +{added:,} form values{'' if apply else '  (dry run)'}")
 
-def pick(label: str, items: list, allow_all: bool = True) -> list | None:
-    if not items:
-        print(f"No {label} found.")
-        return None
-    print(f"\n{label}:")
-    for i, p in enumerate(items, 1):
-        print(f"  [{i}] {p['name']}")
-    prompt = f"\nSelect number{', or  all' if allow_all else ''}: "
-    sel = input(prompt).strip().lower()
-    if allow_all and sel == "all":
-        return items
+
+# ── iCloud verification (Safari history) ──────────────────────────────────────
+
+def read_generations(db_path: str, tmpdir: str) -> dict[str, str]:
+    snap = snapshot(db_path, tmpdir,
+                    f"verify-{os.path.basename(os.path.dirname(db_path))}.db")
+    conn = sqlite3.connect(f"file:{snap}?mode=ro", uri=True)
     try:
-        idx = int(sel) - 1
-        if 0 <= idx < len(items):
-            return [items[idx]]
-    except ValueError:
-        pass
-    print("Invalid selection.")
-    return None
+        return dict(conn.execute(
+            "SELECT key, value FROM metadata WHERE key LIKE '%generation%'"))
+    finally:
+        conn.close()
 
 
-def _backup(path: str) -> None:
-    shutil.copy2(path, path + ".migrator.bak")
-    print(f"  Backed up → {os.path.basename(path)}.migrator.bak")
+def verify_icloud(stamps: list[tuple[str, int]], tmpdir: str) -> None:
+    hdr("iCloud verification")
+    for db, stamp in stamps:
+        print(f"  {os.path.basename(os.path.dirname(db))}: rows stamped generation {stamp}")
+    print("\n  Launch Safari now and open any page (one history modification")
+    print("  schedules the upload cycle, ~90 s later).")
+    ans = input("  Watch the upload watermark now? [y/N] ").strip().lower()
+    if ans not in ("y", "yes"):
+        print("  Later, check with:")
+        for db, stamp in stamps:
+            print(f'    sqlite3 {db} "select key,value from metadata')
+            print(f'      where key like \'%generation%\';"   → last_synced must read {stamp}')
+        return
+    deadline = time.time() + 240
+    while time.time() < deadline:
+        time.sleep(10)
+        all_ok = True
+        for db, stamp in stamps:
+            gens = read_generations(db, tmpdir)
+            last = gens.get("last_synced_generation")
+            if last is None or int(last) < stamp:
+                all_ok = False
+                print(f"  … waiting (last_synced={last}, want {stamp})")
+            else:
+                print(f"  ✓ {os.path.basename(os.path.dirname(db))}: "
+                      f"last_synced={last} — rows uploaded to iCloud")
+        if all_ok:
+            print("\n  ✓ iCloud history upload verified.")
+            return
+    print("\n  ⚠ timed out — the rows are still inside the upload window and")
+    print("    should upload on the next idle cycle. Re-check later with the")
+    print("    sqlite3 command above; last_synced must land exactly on the stamp.")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main() -> int:
-    print("--- Chromium Browser Data Migrator ---")
-    print("Migrates: History · Bookmarks · Autofill form values\n")
+    ap = argparse.ArgumentParser(
+        description="Migrate browsing data between Chromium browsers and Safari")
+    ap.add_argument("--apply", action="store_true",
+                    help="write changes (default: dry run)")
+    ap.add_argument("--allow-cross-role", action="store_true",
+                    help="permit work → personal or personal → work routing")
+    a = ap.parse_args()
 
-    profiles = get_all_profiles()
+    print("── browser-migrate " + "─" * 42)
+    print("History · bookmarks · autofill — Chromium ↔ Safari, per profile")
+    print("Dry run by default; --apply to write.")
+
+    profiles = get_chromium_profiles() + get_safari_profiles()
     if not profiles:
-        print("No profiles found.")
-        return 1
+        die("no profiles found")
 
-    sources = pick("Source profiles", profiles, allow_all=True)
-    if not sources:
-        return 1
+    classify_roles(profiles)
+    sources = pick_sources(profiles)
+    target = pick_target(profiles, sources)
+    routes = resolve_routes(sources, target, a.allow_cross_role)
+    if not routes:
+        print("\nNothing to do (only self-routes selected).")
+        return 0
 
-    src_paths = {s["history_path"] for s in sources}
-    remaining = [p for p in profiles if p["history_path"] not in src_paths]
-    targets = pick("Target profiles", remaining, allow_all=False)
-    if not targets:
-        return 1
+    tmpdir = tempfile.mkdtemp(prefix="migrate-")
+    try:
+        if a.apply:
+            safari_plist_write = bool(
+                [t for _, t in routes if t["kind"] == "safari"]
+                and any(s["kind"] == "chromium" for s, _ in routes))
+            guard_targets(routes, safari_plist_write)
 
-    target = targets[0]
-    print(f"\n⚠  Make sure {target['name']} is fully closed.")
-    input("Press Enter when ready...")
+        stamps = migrate_history(routes, a.apply, tmpdir)
+        migrate_bookmarks(routes, a.apply, tmpdir)
+        migrate_autofill(routes, a.apply, tmpdir)
 
-    # ── History ────────────────────────────────────────────────────────────────
-    print("\nReading source history...")
-    all_urls: list = []
-    all_visits: list = []
-    for src in sources:
-        urls, visits = read_history(src["history_path"])
-        all_urls.extend(urls)
-        all_visits.extend(visits)
-        print(f"  {len(urls):>8,} URLs  {len(visits):>10,} visits  ← {src['name']}")
-
-    print(f"\n── {target['name']} ──")
-    _backup(target["history_path"])
-    h_urls, h_visits = merge_history(all_urls, all_visits, target["history_path"])
-    print(f"  History:   +{h_urls:,} URLs  +{h_visits:,} visits")
-
-    # ── Bookmarks ──────────────────────────────────────────────────────────────
-    bm_added = 0
-    bm_backed_up = False
-    for src in sources:
-        if not os.path.exists(src["bookmarks_path"]):
-            continue
-        if src["bookmarks_path"] == target["bookmarks_path"]:
-            continue
-        if not bm_backed_up:
-            if os.path.exists(target["bookmarks_path"]):
-                _backup(target["bookmarks_path"])
-            bm_backed_up = True
-        bm_added += merge_bookmarks(src["bookmarks_path"], target["bookmarks_path"])
-    if bm_added:
-        print(f"  Bookmarks: +{bm_added:,}")
-
-    # ── Autofill ───────────────────────────────────────────────────────────────
-    af_added = 0
-    af_backed_up = False
-    for src in sources:
-        if not os.path.exists(src["web_data_path"]):
-            continue
-        if not os.path.exists(target["web_data_path"]):
-            continue
-        if src["web_data_path"] == target["web_data_path"]:
-            continue
-        if not af_backed_up:
-            _backup(target["web_data_path"])
-            af_backed_up = True
-        af_added += merge_autofill(src["web_data_path"], target["web_data_path"])
-    if af_added:
-        print(f"  Autofill:  +{af_added:,} form values")
-
-    print("\nDone. Launch the target browser to verify.")
+        if a.apply:
+            print("\n── Done " + "─" * 52)
+            print("Launch the target browser to verify.")
+            if stamps:
+                verify_icloud(stamps, tmpdir)
+        else:
+            print("\n── Dry run " + "─" * 48)
+            print("Nothing written. Re-run with --apply to make these changes.")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
     return 0
 
 
