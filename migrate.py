@@ -361,26 +361,81 @@ def resolve_routes(sources: list[dict], target: dict,
 
 # ── Quit guards and backups ────────────────────────────────────────────────────
 
-def browser_running(pattern: str) -> bool:
-    return subprocess.run(["pgrep", "-if", pattern],
-                          capture_output=True).returncode == 0
+def _proc_detail(pids: list[str]) -> str:
+    """Short command names for matched PIDs, for the quit-guard message."""
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "command=", "-p", ",".join(pids[:3])],
+            capture_output=True, text=True).stdout.strip()
+        return "; ".join(l.split("Contents/MacOS/")[-1] for l in out.splitlines())
+    except Exception:
+        return ""
+
+
+def _pgrep(browser: str) -> list[str]:
+    """PIDs of a running browser (empty list when not running)."""
+    if browser == "Safari":
+        r = subprocess.run(["pgrep", "-x", "Safari"],
+                           capture_output=True, text=True)
+    else:
+        bundle = BROWSER_BUNDLES.get(browser, browser + ".app")
+        r = subprocess.run(["pgrep", "-if", bundle],
+                           capture_output=True, text=True)
+    return r.stdout.split() if r.returncode == 0 else []
+
+
+def _quit_app(browser: str) -> None:
+    """Graceful AppleScript quit — works for windowless apps too."""
+    app = BROWSER_BUNDLES.get(browser, browser + ".app").removesuffix(".app")
+    r = subprocess.run(["osascript", "-e", f'quit app "{app}"'],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"  AppleScript quit failed for {app}: {r.stderr.strip()}")
+
+
+def _wait_quit(browser: str, timeout: float = 15.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _pgrep(browser):
+            return True
+        time.sleep(0.5)
+    return False
 
 
 def guard_targets(routes: list[tuple[dict, dict]], safari_plist_write: bool) -> None:
-    """Every browser that will be written must be quit."""
+    """Every browser that will be written must be quit. Offers a graceful
+    AppleScript quit (windowless apps count as running: ⌘W is not ⌘Q)."""
     names = {t["browser"] for _, t in routes}
     if safari_plist_write:
         names.add("Safari")
-    running = []
-    for browser in sorted(names):
-        if browser == "Safari":
-            if subprocess.run(["pgrep", "-x", "Safari"]).returncode == 0:
-                running.append("Safari")
-        elif browser_running(BROWSER_BUNDLES.get(browser, browser + ".app")):
-            running.append(browser)
-    if running:
-        die("target browser still running: " + ", ".join(running)
-            + ". Quit it (⌘Q) and re-run with --apply.")
+
+    hits = [(b, pids) for b in sorted(names) if (pids := _pgrep(b))]
+    if not hits:
+        return
+
+    print("\n  ⚠ target browser still running: " + ", ".join(b for b, _ in hits))
+    for b, pids in hits:
+        detail = _proc_detail(pids)
+        if detail:
+            print(f"    {b}: {detail}")
+    try:
+        ans = input("  Quit it now? (graceful AppleScript quit) [Y/n] ").strip().lower()
+    except EOFError:
+        ans = "n"
+    if ans in ("", "y", "yes"):
+        for b, _ in hits:
+            _quit_app(b)
+        if all(_wait_quit(b) for b, _ in hits) and not any(_pgrep(b) for b, _ in hits):
+            print("  ✓ quit confirmed")
+            return
+    pids = {b: p for b, p in hits}
+    die("target browser still running: " + ", ".join(b for b, _ in hits)
+        + ". Quit it with ⌘Q, or from the terminal:\n"
+        + "".join(f"    osascript -e 'quit app \""
+                  + BROWSER_BUNDLES.get(b, b + ".app").removesuffix(".app")
+                  + "\"'   (or: kill " + " ".join(pids.get(b, [])) + ")\n"
+                  for b, _ in hits)
+        + "  Closing the window is not enough — the app keeps running.")
 
 
 def _backup(path: str) -> None:

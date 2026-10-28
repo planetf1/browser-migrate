@@ -155,7 +155,8 @@ def run_sync(personal_dirs: list[str], work_dirs: list[str], apply: bool) -> int
     Idempotent: URLs already anywhere in the plist are skipped.
     Shared core of the CLI and migrate.py; returns 0 on success.
     """
-    if apply and subprocess.run(["pgrep", "-x", "Safari"]).returncode == 0:
+    if apply and subprocess.run(["pgrep", "-x", "Safari"],
+                               capture_output=True).returncode == 0:
         die("Safari is running — quit it (⌘Q) first, then retry with --apply.")
 
     with open(PLIST, "rb") as f:

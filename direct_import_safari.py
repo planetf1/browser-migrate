@@ -179,7 +179,8 @@ def main() -> int:
     profile_dir = find_profile_dir(sys.argv[2])
     db_path = os.path.join(profile_dir, "History.db")
 
-    if subprocess.run(["pgrep", "-x", "Safari"]).returncode == 0:
+    if subprocess.run(["pgrep", "-x", "Safari"],
+                      capture_output=True).returncode == 0:
         die("Safari is running — quit it (⌘Q) first, then retry.")
 
     with open(json_path, "r", encoding="utf-8") as f:
