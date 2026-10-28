@@ -2,17 +2,17 @@
 
 > **Personal, unpolished scripts.** Written to test whether Safari was a viable daily driver by migrating Edge browsing data. Not a polished tool — no error recovery, no tests, no packaging. Use at your own risk and keep backups.
 
-Migrate browsing data on macOS between Chromium-based browsers (Edge, Chrome, Brave, Vivaldi, Chromium) and to Safari.
+Migrate browsing data on macOS between Chromium-based browsers (Edge, Chrome, Brave, Vivaldi, Chromium) and Safari, in any direction, via one interactive tool (`migrate.py`).
 
 ## What gets migrated
 
-### Chromium ↔ Chromium (`migrate.py`)
+### Any direction (`migrate.py`)
 
-| Data | How stored | Deduplicated by |
-| --- | --- | --- |
-| Browsing history | SQLite `History` DB | URL + visit timestamp |
-| Bookmarks | JSON `Bookmarks` file | URL — folder structure preserved |
-| Autofill form values | SQLite `Web Data` | (field name, value) pair |
+| Data | Chromium | Safari | Deduplicated by |
+| --- | --- | --- | --- |
+| Browsing history | SQLite `History` DB | per-profile `History.db` | URL + visit timestamp (±2 µs Safari round-trip tolerance) |
+| Bookmarks | JSON `Bookmarks` file | shared `Bookmarks.plist` | URL — folder structure preserved |
+| Autofill form values | SQLite `Web Data` | not supported | (field name, value) pair |
 
 **Not migrated** — encrypted with browser-specific OS keychain keys, no practical way to move them:
 
@@ -41,81 +41,102 @@ uv sync   # or skip — there are no dependencies to install
 
 ---
 
-## Usage: Chromium ↔ Chromium
+## Usage: `migrate.py` (the one command)
 
 ```bash
-uv run python migrate.py
+uv run migrate.py            # dry run: plan only, nothing written
+uv run migrate.py --apply    # write (backups first, browsers must be quit)
 ```
 
-**Step 1 — pick a source.** Any installed browser and profile. Type a number or `all` to merge every profile.
+One interactive flow for Chromium ↔ Chromium, Chromium → Safari and
+Safari → Chromium. History, bookmarks, and autofill (Chromium targets
+only; Safari has no accessible autofill store).
+
+**Step 1 — classify roles.** Every discovered profile (Chromium and
+Safari) is listed once; you say which are work, everything else is
+personal. Profiles sharing an account email inherit the same role.
+Nothing is hardcoded: no UUIDs, no emails in the source.
 
 ```text
---- Chromium Browser Data Migrator ---
-Migrates: History · Bookmarks · Autofill form values
-
-Source profiles:
-  [1] Microsoft Edge Canary - Work Profile [Default] (work@company.com)
-  [2] Microsoft Edge Canary - Personal [Profile 1] (me@example.com)
-  [3] Google Chrome Dev - Your Chrome [Default] (me@gmail.com)
-  [4] Google Chrome Beta - Your Chrome [Default] (me@gmail.com)
-
-Select number, or  all: 1
+── Roles ───────────────────────────────────────────
+Which profiles are WORK? Everything else is personal.
+Work profiles (numbers, Enter for none): 2 8
+  work      Microsoft Edge Beta — Profile 2 [Profile 1] (jonesn@uk.ibm.com), Safari — 1B5279A1
+  personal  Microsoft Edge Beta — Profile 1 [Default] (nigel@cherrybyte.me.uk), …
 ```
 
-**Step 2 — pick a target.** The source profile is excluded from the list automatically.
+**Step 2 — pick a source.** Any installed browser and profile; numbers
+or `all`.
+
+**Step 3 — pick a target.** Individual profiles, or a per-browser group
+entry (`Safari — all profiles (routed by role)`) that routes each source
+to the same-role target profile in one run.
+
+**Routing insists work → work, personal → personal.** Cross-role
+selections are refused with an explanation; `--allow-cross-role`
+overrides (history only; bookmark zones never cross).
+
+**Dry run by default.** The plan shows exactly what `--apply` would do,
+computed against read-only snapshots. Sources may stay open. For
+`--apply` the tool itself checks every target browser is quit (Safari via
+`pgrep -x Safari`, Chromium via the full `.app` bundle path, so Teams'
+embedded Edge helpers never false-positive) and refuses to run otherwise.
 
 ```text
-Target profiles:
-  [1] Microsoft Edge Dev - Work Profile [Default] (work@company.com)
-  [2] Microsoft Edge Dev - Personal [Profile 1] (me@example.com)
-  [3] Google Chrome Dev - Your Chrome [Default] (me@gmail.com)
-  [4] Google Chrome Dev - Your Chrome [Profile 1] (work@gmail.com)
-  [5] Google Chrome Beta - Your Chrome [Default] (me@gmail.com)
+── History ─────────────────────────────────────────
 
-Select number: 4
+  → Safari — default (~/Library/Safari)
+  History:  +651 URLs  (9,956 already present)  (dry run)
+
+  → Safari — 1B5279A1
+  History:  +718 URLs  (4,841 already present)  (dry run)
+
+── Bookmarks ───────────────────────────────────────
+
+  Chromium → Safari shared plist (curated filing)
+  …
+
+── Dry run ─────────────────────────────────────────
+Nothing written. Re-run with --apply to make these changes.
 ```
 
-**Step 3 — close the target browser** when prompted, then press Enter.
+Per-direction semantics (all established by the October 2026 migration):
 
-```text
-⚠  Make sure Google Chrome Dev - Your Chrome [Profile 1] is fully closed.
-Press Enter when ready...
-```
-
-**Step 4 — done.**
-
-```text
-Reading source history...
-     2,758 URLs       8,140 visits  ← Microsoft Edge Canary - Work Profile
-
-── Google Chrome Dev - Your Chrome [Profile 1] ──
-  Backed up → History.migrator.bak
-  History:   +2,758 URLs  +8,126 visits
-  Backed up → Bookmarks.migrator.bak
-  Bookmarks: +161
-  Backed up → Web Data.migrator.bak
-  Autofill:  +68 form values
-
-Done. Launch the target browser to verify.
-```
+- **Chromium → Safari history**: direct `History.db` write, one visit per
+  URL (latest), stamped `current_generation + 1` so rows reach iCloud
+  history sync. After `--apply` the tool offers to watch the upload
+  watermark (`last_synced_generation` landing exactly on the stamp is the
+  proof the rows went up).
+- **Safari → Chromium history**: per-visit rows with `(url, visit_time
+  ± 2 µs)` dedupe (the Cocoa REAL round-trip drifts 1–2 µs).
+- **Chromium → Safari bookmarks**: curated filing into the shared
+  `Bookmarks.plist` (personal → scheme folders, work → `Work/` subtree,
+  Edge Workspaces → `Edge Workspaces/`), junk-filtered, idempotent.
+- **Safari → Chromium bookmarks**: insert-only under a reversible
+  `From Safari` folder in the target's `other` root; the `Work/` subtree
+  only ever targets a work profile.
+- **Autofill**: Chromium ↔ Chromium only.
 
 ### Backups
 
-Before touching any file, the script writes `<filename>.migrator.bak` alongside the original in the browser's profile directory. If anything goes wrong, copy it back and restart the browser.
+Before touching any file, every writer takes a timestamped backup
+(`<filename>.migrator-<YYYYMMDD-HHMMSS>.bak`, including SQLite
+`-wal`/`-shm` sidecars; Safari `History.db` uses a consistent `VACUUM INTO`
+backup). If anything goes wrong, copy it back and restart the browser.
 
 ```text
 ~/Library/Application Support/Google/Chrome Dev/Default/
   History
-  History.migrator.bak       ← safe to delete once you've verified
-  Bookmarks
-  Bookmarks.migrator.bak
-  Web Data
-  Web Data.migrator.bak
+  History.migrator-20261028-174102.bak   ← safe to delete once you've verified
+  Bookmarks.migrator-20261028-174102.bak
+  Web Data.migrator-20261028-174102.bak
 ```
 
 ### Supported browsers
 
-Auto-detected from `~/Library/Application Support/`:
+Auto-detected from `~/Library/Application Support/` (Chromium family)
+plus Safari (default profile and every container profile with a
+`History.db`):
 
 | Browser | Channels |
 | --- | --- |
@@ -124,6 +145,7 @@ Auto-detected from `~/Library/Application Support/`:
 | Chromium | — |
 | Brave | — |
 | Vivaldi | — |
+| Safari | default + per-profile containers |
 
 Multiple profiles per browser are all detected and listed.
 
@@ -172,10 +194,12 @@ Then in Safari: **File → Import From → Browsing Data from File…** and sele
 
 ## Usage: Edge → Safari, per profile (direct DB import)
 
-Maps Edge profiles onto Safari profiles (Edge `Default` → Safari `default`,
-Edge `Profile 1` → the Safari work profile UUID) and writes history straight
-into each profile's `History.db`. Safari must be quit; every run takes a
-timestamped `VACUUM INTO` backup first.
+`migrate.py` runs this path directly (Chromium source → Safari target,
+no intermediate JSON). The standalone CLI remains for importing an
+existing `History.json` export; it maps Edge profiles onto Safari profiles
+(Edge `Default` → Safari `default`, Edge `Profile 1` → the Safari work
+profile UUID) and writes history straight into each profile's `History.db`.
+Safari must be quit; every run takes a timestamped `VACUUM INTO` backup first.
 
 ```bash
 uv run direct_import_safari.py History_<edge-profile>.json <uuid-prefix>
@@ -227,11 +251,12 @@ HTML reconciliation described in the `macos-safari-migration` skill.
 
 ## Usage: Safari → Edge (reverse pull)
 
-After a stint in Safari, pull the Safari-native browsing back into Edge
-Beta, per profile (personal → `Default`, work → `Profile 1`; every write
-is preceded by an account-email verification against the target profile's
-`Preferences`, and the quit-guard matches the Edge **Beta** bundle path —
-Teams' embedded Edge WebView2 helpers false-positive a naive name check).
+`migrate.py` covers this in one command (pick Safari profiles as source,
+the Edge Beta group as target). The standalone scripts remain for
+date-filtered pulls and account-email verification against a fixed profile
+map (personal → `Default`, work → `Profile 1`; the quit-guard matches the
+Edge **Beta** bundle path — Teams' embedded Edge WebView2 helpers
+false-positive a naive name check):
 
 ```bash
 uv run safari_to_edge.py --since 2026-10-08 --apply        # history
@@ -336,24 +361,17 @@ A browser's `History` and `Web Data` SQLite files are locked while the browser i
 
 | Script | Purpose |
 | --- | --- |
-| `migrate.py` | **Main tool** — bidirectional Chromium ↔ Chromium migration |
-| `export_edge.py` | Edge history → `History.json` (Safari schema) |
+| `migrate.py` | **Main tool** — unified interactive migration: Chromium ↔ Chromium ↔ Safari, role-routed, dry-run default |
+| `export_edge.py` | Edge history → `History.json` (Safari schema; kept for the Safari UI import route and `restamp_imports.py` matching) |
 | `validator.py` | Validates a `History.json` against Apple's import schema |
-| `direct_import_safari.py` | Import a `History.json` directly into a Safari profile's `History.db` (per-profile, stamps `current+1`) |
+| `direct_import_safari.py` | Import a `History.json` directly into a Safari profile's `History.db` (per-profile, stamps `current+1`; `import_items` is the shared write core) |
 | `restamp_imports.py` | Re-stamp previously imported rows into the sync upload window (id-range + export-matched, conservative) |
-| `push_history_sync.py` | Re-stamp rows by generation selector into the upload window (older variant) |
-| `merge_safari_history.py` | Merge a `History.json` into a profile `History.db` (September 2026 flow) |
-| `sync_edge_bookmarks.py` | Delta-sync Edge bookmarks into the shared `Bookmarks.plist` (junk-filtered, dry-run first) |
+| `sync_edge_bookmarks.py` | Delta-sync Edge bookmarks into the shared `Bookmarks.plist` (junk-filtered, dry-run first; `run_sync` is the shared core) |
 | `dedupe_bookmarks.py` | Reading List stray repair + priority-aware bookmark dedupe + seeded-defaults strip |
 | `reorganise_bookmarks.py` | Top-level reorganisation into scheme folders (September 2026) |
 | `categorise_bookmarks.py` | URL classification ruleset used by the above |
 | `safari_to_edge.py` | Reverse history pull: Safari profile DBs → Edge Beta History DBs (±2 µs tolerance dedupe, `--since` filter) |
-| `safari_to_edge_bookmarks.py` | Reverse bookmark pull into a reversible `From Safari` folder per Edge profile |
+| `safari_to_edge_bookmarks.py` | Reverse bookmark pull into a reversible `From Safari` folder per Edge profile (`pull_into_chromium` is the shared core) |
 | `brm.py` | Bookmark CLI over the four profile stores: `stores`, `dedupe` |
 | `brmlib.py` | Shared store model: canonicaliser, Safari/Edge adapters, quit-guards, backups |
-| `final.py` | Alternative Safari export using per-visit rows |
-| `extract_edge_all_channels.py` | Scans all installed Edge channels |
-| `extract_edge_multiprofile.py` | Multi-profile extraction |
-| `extract_full_edge.py` | Full history extraction with channel version metadata |
-| `migrate_edge_fixed.py` | Fixed-epoch history migration |
-| `migrate_edge_select.py` | Interactive profile selection |
+| `archive/` | Superseded one-off scripts (see `archive/README.md`) |
