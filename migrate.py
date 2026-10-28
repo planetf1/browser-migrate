@@ -74,6 +74,8 @@ SAFARI_DEFAULT_DIR = os.path.expanduser("~/Library/Safari")
 SAFARI_PROFILES_BASE = os.path.expanduser(
     "~/Library/Containers/com.apple.Safari/Data/Library/Safari/Profiles")
 SAFARI_PLIST = os.path.expanduser("~/Library/Safari/Bookmarks.plist")
+SAFARI_TABS_DB = os.path.expanduser(
+    "~/Library/Containers/com.apple.Safari/Data/Library/Safari/SafariTabs.db")
 
 # Chromium stores µs since 1601-01-01; Safari Cocoa seconds since 2001-01-01.
 CHROMIUM_TO_COCOA = 11_644_473_600 + 978_307_200
@@ -119,6 +121,7 @@ def get_chromium_profiles() -> list[dict]:
             display = f"{browser_name} — {name}{suffix}"
             if email:
                 display += f" ({email})"
+            display += f"  ·  {_chromium_stats(history_path)}"
             profiles.append({
                 "kind": "chromium",
                 "browser": browser_name,
@@ -132,14 +135,88 @@ def get_chromium_profiles() -> list[dict]:
     return profiles
 
 
+def _db_stats(db_path: str, cocoa: bool) -> str:
+    """Visit count + date range from a snapshot of a history DB, so every
+    listed profile is distinguishable at a glance."""
+    tmpdir = tempfile.mkdtemp(prefix="bm-stats-")
+    try:
+        snap = snapshot(db_path, tmpdir, "db")
+        conn = sqlite3.connect(f"file:{snap}?mode=ro", uri=True)
+        try:
+            table = "history_visits" if cocoa else "visits"
+            row = conn.execute(
+                f"select count(*), min(visit_time), max(visit_time)"
+                f" from {table} where visit_time > 0").fetchone()
+        finally:
+            conn.close()
+        if not row or not row[0]:
+            return "empty"
+        count, lo, hi = row
+        if cocoa:                      # Cocoa seconds → unix
+            lo_u, hi_u = lo + 978_307_200, hi + 978_307_200
+        else:                          # Chromium µs since 1601 → unix
+            lo_u, hi_u = lo / 1e6 - 11_644_473_600, hi / 1e6 - 11_644_473_600
+        return (f"{count:,} visits, {time.strftime('%Y-%m', time.localtime(lo_u))}→"
+                f"{time.strftime('%Y-%m', time.localtime(hi_u))}")
+    except Exception:
+        return "(stats unavailable)"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _chromium_stats(history_path: str) -> str:
+    return _db_stats(history_path, cocoa=False)
+
+
+def _safari_stats(db_path: str) -> str:
+    return _db_stats(db_path, cocoa=True)
+
+
+def safari_profile_names() -> dict[str, str]:
+    """Safari profile display names, keyed 'default' or full container UUID.
+
+    Safari keeps profile names in CloudKit, but a local copy lives in
+    SafariTabs.db: the bookmarks table has one row per profile with the
+    name as title, the container UUID as server_id, and external_uuid
+    'DefaultProfile' marking the default profile.
+    """
+    names: dict[str, str] = {}
+    if not os.path.exists(SAFARI_TABS_DB):
+        return names
+    tmpdir = tempfile.mkdtemp(prefix="bm-names-")
+    try:
+        snap = snapshot(SAFARI_TABS_DB, tmpdir, "SafariTabs.db")
+        conn = sqlite3.connect(f"file:{snap}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                "select title, server_id, external_uuid from bookmarks"
+                " where title is not null").fetchall()
+        finally:
+            conn.close()
+        for title, server_id, external_uuid in rows:
+            if external_uuid == "DefaultProfile":
+                names["default"] = title
+            elif (isinstance(server_id, str) and len(server_id) == 36
+                  and server_id.count("-") == 4):
+                names[server_id.upper()] = title
+        return names
+    except Exception:
+        return names
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def get_safari_profiles() -> list[dict]:
+    names = safari_profile_names()
     profiles = []
     if os.path.exists(os.path.join(SAFARI_DEFAULT_DIR, "History.db")):
+        label = names.get("default", "default")
         profiles.append({
             "kind": "safari",
             "browser": "Safari",
             "email": "",
-            "name": "Safari — default (~/Library/Safari)",
+            "name": f"Safari — {label} [default]  ·  "
+                    f"{_safari_stats(os.path.join(SAFARI_DEFAULT_DIR, 'History.db'))}",
             "history_path": os.path.join(SAFARI_DEFAULT_DIR, "History.db"),
             "bookmarks_path": SAFARI_PLIST,
             "web_data_path": None,
@@ -150,11 +227,13 @@ def get_safari_profiles() -> list[dict]:
             full = os.path.join(SAFARI_PROFILES_BASE, item)
             if not os.path.exists(os.path.join(full, "History.db")):
                 continue  # companion profiles without history
+            label = names.get(item.upper(), item.split("-")[0])
             profiles.append({
                 "kind": "safari",
                 "browser": "Safari",
                 "email": "",
-                "name": f"Safari — {item.split('-')[0]}",
+                "name": f"Safari — {label} [{item.split('-')[0]}]  ·  "
+                        f"{_safari_stats(os.path.join(full, 'History.db'))}",
                 "history_path": os.path.join(full, "History.db"),
                 "bookmarks_path": SAFARI_PLIST,
                 "web_data_path": None,
@@ -186,8 +265,8 @@ def classify_roles(profiles: list[dict]) -> None:
         if p["email"] and p["email"] in work_emails:
             p["role"] = "work"
     for role in ("work", "personal"):
-        names = [p["name"] for p in profiles if p["role"] == role]
-        print(f"  {role:9} {', '.join(names) if names else '(none)'}")
+        nums = [str(i) for i, p in enumerate(profiles, 1) if p["role"] == role]
+        print(f"  {role:9} {', '.join(nums) if nums else '(none)'}")
 
 
 # ── Selection UI ───────────────────────────────────────────────────────────────

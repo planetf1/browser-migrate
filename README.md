@@ -59,17 +59,24 @@ Nothing is hardcoded: no UUIDs, no emails in the source.
 
 ```text
 ── Profiles ────────────────────────────────────────
-  [1] Microsoft Edge Beta — Profile 1 [Default] (nigel@cherrybyte.me.uk)
-  [2] Microsoft Edge Beta — Profile 2 [Profile 1] (jonesn@uk.ibm.com)
+  [1] Microsoft Edge Beta — Profile 1 [Default] (nigel@cherrybyte.me.uk)  ·  22,145 visits, 2026-07→2026-10
+  [2] Microsoft Edge Beta — Profile 2 [Profile 1] (jonesn@uk.ibm.com)  ·  14,943 visits, 2026-07→2026-10
   …
-  [8] Safari — 1B5279A1
+  [7] Safari — Personal [default]  ·  22,067 visits, 2026-05→2026-10
+  [8] Safari — Work [1B5279A1]  ·  7,395 visits, 2026-06→2026-10
 
 ── Roles ───────────────────────────────────────────
 Which profiles are WORK? Everything else is personal.
 Work profiles (numbers, or Enter for none): 2 8
-  work      Microsoft Edge Beta — Profile 2 [Profile 1] (jonesn@uk.ibm.com), Safari — 1B5279A1
-  personal  Microsoft Edge Beta — Profile 1 [Default] (nigel@cherrybyte.me.uk), …
+  work      2, 8
+  personal  1, 3, 4, 5, 6, 7, 9
 ```
+
+Safari profile names come from `SafariTabs.db` (Safari keeps them in
+CloudKit; the tabs DB holds the only local copy), with the container
+UUID prefix kept for reference; every profile also shows visit count
+and date range so Chromium profiles without an email are
+ distinguishable too.
 
 **Step 2 — pick a source.** Any installed browser and profile; numbers
 or `all`.
