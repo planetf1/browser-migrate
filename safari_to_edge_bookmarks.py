@@ -168,6 +168,69 @@ def to_chromium(tree: dict, next_id: list[int]) -> list[dict]:
     return out
 
 
+def pull_into_chromium(leaves: list[tuple[str, str, list[str]]], bm_path: str,
+                        apply: bool, inbox_name: str = INBOX_NAME) -> int:
+    """Insert Safari leaves not already in the target Chromium profile.
+
+    Reads from a snapshot (target browser may be running); on apply, takes a
+    timestamped backup and writes under a single reversible inbox folder in
+    the 'other' root. Shared core of the CLI and migrate.py.
+    Returns the number of bookmarks added (or that would be, in dry run).
+    """
+    tmpdir = tempfile.mkdtemp(prefix="s2ebm-core-")
+    try:
+        snap = os.path.join(tmpdir, "Bookmarks.json")
+        shutil.copy2(bm_path, snap)
+        with open(snap, "r", encoding="utf-8") as f:
+            tree = json.load(f)
+
+        existing_urls, max_id = edge_urls_and_ids(tree)
+        new_leaves = [(t, u, p) for t, u, p in leaves if u not in existing_urls]
+        inbox = build_inbox_tree(new_leaves)
+        by_top = defaultdict(int)
+        for _, _, path in new_leaves:
+            by_top[path[0] if path else "(root)"] += 1
+
+        print(f"  Safari leaves considered: {len(leaves):,}")
+        print(f"  already present (URL dedupe): {len(leaves) - len(new_leaves):,}")
+        print(f"  would add: {len(new_leaves):,} bookmarks"
+              f"{'  (DRY RUN)' if not apply else ''}")
+        if by_top:
+            print("  by Safari folder: "
+                  + "  ".join(f"{k}×{v}" for k, v in
+                              sorted(by_top.items(), key=lambda kv: -kv[1])[:8]))
+        for title, url, path in new_leaves[:5]:
+            loc = "/".join(path[:3]) or "(root)"
+            print(f"  e.g. [{loc}] {title[:40]} — {url[:64]}")
+
+        if apply and new_leaves:
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            shutil.copy2(bm_path, f"{bm_path}.safari-import-{ts}.bak")
+            nodes = to_chromium(inbox, [max_id])
+            other = tree["roots"]["other"]
+            inbox_node = next((c for c in other.get("children", [])
+                               if c.get("name") == inbox_name
+                               and c.get("type") == "folder"), None)
+            if inbox_node is None:
+                max_id += 1
+                inbox_node = {
+                    "date_added": str(int((time.time() + CHROMIUM_EPOCH_OFFSET) * 1e6)),
+                    "date_modified": str(int((time.time() + CHROMIUM_EPOCH_OFFSET) * 1e6)),
+                    "guid": str(uuid.uuid4()), "id": str(max_id),
+                    "name": inbox_name, "type": "folder", "children": [],
+                }
+                other.setdefault("children", []).append(inbox_node)
+            inbox_node.setdefault("children", []).extend(nodes)
+            tree.pop("checksum", None)  # Chromium recomputes on next save
+            with open(bm_path, "w", encoding="utf-8") as f:
+                json.dump(tree, f, indent=3, ensure_ascii=False)
+            print(f"  added {len(new_leaves):,} bookmarks under "
+                  f"'{inbox_name}' in 'other' (backup: Bookmarks.safari-import-{ts}.bak)")
+        return len(new_leaves)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--profile", choices=["personal", "work"], default=None)
@@ -199,7 +262,6 @@ def main() -> int:
           f"{len(work):,} work leaves, {len(excluded):,} excluded "
           f"(Edge Workspaces{'' if a.reading_list else ' + Reading List'})\n")
 
-    ts = time.strftime("%Y%m%d-%H%M%S")
     selected = [a.profile] if a.profile else ["personal", "work"]
     grand = 0
     for prof in selected:
@@ -213,56 +275,9 @@ def main() -> int:
         if not os.path.exists(bm_path):
             die(f"missing {bm_path}")
 
-        snap_edge = os.path.join(tmpdir, f"bookmarks-{prof}.json")
-        shutil.copy2(bm_path, snap_edge)
-        with open(snap_edge, "r", encoding="utf-8") as f:
-            edge_tree = json.load(f)
-
-        existing_urls, max_id = edge_urls_and_ids(edge_tree)
         safari_leaves = personal if prof == "personal" else work
-        new_leaves = [(t, u, p) for t, u, p in safari_leaves if u not in existing_urls]
-
-        inbox = build_inbox_tree(new_leaves)
-        by_top = defaultdict(int)
-        for _, _, path in new_leaves:
-            by_top[path[0] if path else "(root)"] += 1
-
         print(f"── {prof}: Safari shared tree → Edge Beta {edge_dir!r} ({email}) ──")
-        print(f"Safari leaves considered: {len(safari_leaves):,}")
-        print(f"  already in Edge (URL dedupe): {len(safari_leaves) - len(new_leaves):,}")
-        print(f"  would add: {len(new_leaves):,} bookmarks"
-              f"{'  (DRY RUN)' if not a.apply else ''}")
-        if by_top:
-            print("  by Safari folder: "
-                  + "  ".join(f"{k}×{v}" for k, v in
-                              sorted(by_top.items(), key=lambda kv: -kv[1])[:8]))
-        for title, url, path in new_leaves[:5]:
-            loc = "/".join(path[:3]) or "(root)"
-            print(f"  e.g. [{loc}] {title[:40]} — {url[:64]}")
-
-        if a.apply and new_leaves:
-            shutil.copy2(bm_path, f"{bm_path}.safari-import-{ts}.bak")
-            nodes = to_chromium(inbox, [max_id])
-            other = edge_tree["roots"]["other"]
-            inbox_node = next((c for c in other.get("children", [])
-                               if c.get("name") == INBOX_NAME
-                               and c.get("type") == "folder"), None)
-            if inbox_node is None:
-                max_id += 1
-                inbox_node = {
-                    "date_added": str(int((time.time() + CHROMIUM_EPOCH_OFFSET) * 1e6)),
-                    "date_modified": str(int((time.time() + CHROMIUM_EPOCH_OFFSET) * 1e6)),
-                    "guid": str(uuid.uuid4()), "id": str(max_id),
-                    "name": INBOX_NAME, "type": "folder", "children": [],
-                }
-                other.setdefault("children", []).append(inbox_node)
-            inbox_node.setdefault("children", []).extend(nodes)
-            edge_tree.pop("checksum", None)  # Chromium recomputes on next save
-            with open(bm_path, "w", encoding="utf-8") as f:
-                json.dump(edge_tree, f, indent=3, ensure_ascii=False)
-            print(f"  added {len(new_leaves):,} bookmarks under "
-                  f"'{INBOX_NAME}' in 'other' (backup: Bookmarks.safari-import-{ts}.bak)")
-        grand += len(new_leaves)
+        grand += pull_into_chromium(safari_leaves, bm_path, a.apply)
         print()
 
     print(f"TOTAL would add: {grand:,} bookmarks"

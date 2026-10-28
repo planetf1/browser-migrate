@@ -146,14 +146,16 @@ def safari_urls(root: dict) -> set[str]:
     return urls
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--personal", required=True, help="Edge profile dir (personal)")
-    ap.add_argument("--work", required=True, help="Edge profile dir (work)")
-    ap.add_argument("--apply", action="store_true")
-    a = ap.parse_args()
+def run_sync(personal_dirs: list[str], work_dirs: list[str], apply: bool) -> int:
+    """Delta-sync Chromium bookmarks into Safari's shared Bookmarks.plist.
 
-    if a.apply and subprocess.run(["pgrep", "-x", "Safari"]).returncode == 0:
+    personal_dirs → scheme folders (categorise_bookmarks rules, junk-filtered);
+    work_dirs     → the Work/ subtree, Edge folder paths preserved;
+    workspaces_v2 roots (any dir) → top-level 'Edge Workspaces' folder.
+    Idempotent: URLs already anywhere in the plist are skipped.
+    Shared core of the CLI and migrate.py; returns 0 on success.
+    """
+    if apply and subprocess.run(["pgrep", "-x", "Safari"]).returncode == 0:
         die("Safari is running — quit it (⌘Q) first, then retry with --apply.")
 
     with open(PLIST, "rb") as f:
@@ -161,45 +163,67 @@ def main() -> int:
     have = safari_urls(root)
 
     work_node = None
-    for ch in top_level(root):
-        if ch.get("Title") == "Work" and ch.get("WebBookmarkType") == "WebBookmarkTypeList":
-            work_node = ch
-            break
-    if work_node is None:
-        die("no top-level 'Work' folder — create it in Safari first.")
-    work_children = work_node.setdefault("Children", [])
+    if work_dirs:
+        for ch in top_level(root):
+            if ch.get("Title") == "Work" and ch.get("WebBookmarkType") == "WebBookmarkTypeList":
+                work_node = ch
+                break
+        if work_node is None:
+            die("no top-level 'Work' folder — create it in Safari first.")
+        work_children = work_node.setdefault("Children", [])
 
     # --- personal additions → scheme folders --------------------------------
     added_personal: dict[str, list] = {}
     junk: list[tuple[str, str]] = []
-    for root_key, items in edge_bookmarks(a.personal).items():
-        for url, title, path in items:
-            if norm(url) in have:
-                continue
-            why = cb.is_junk(url, title)
-            if why:
-                junk.append((url, why))
-                continue
-            folder = cb.classify(url, title, " > ".join([root_key] + path))
-            added_personal.setdefault(folder, []).append((url, title))
-            have.add(norm(url))
+    for personal_dir in personal_dirs:
+        for root_key, items in edge_bookmarks(personal_dir).items():
+            for url, title, path in items:
+                if norm(url) in have:
+                    continue
+                why = cb.is_junk(url, title)
+                if why:
+                    junk.append((url, why))
+                    continue
+                folder = cb.classify(url, title, " > ".join([root_key] + path))
+                added_personal.setdefault(folder, []).append((url, title))
+                have.add(norm(url))
 
     # --- work additions → Work subtree (Edge folder paths preserved) ---------
     added_work: dict[str, list] = {}
-    for root_key, items in edge_bookmarks(a.work).items():
-        for url, title, path in items:
-            if norm(url) in have:
-                continue
-            rel = path if root_key == "synced" else [p for p in path if p not in STRIP_ROOTS]
-            rel = [p for p in rel if p]  # drop the roots' own empty name
-            key = "/".join(rel) or "(top of Work)"
-            added_work.setdefault(key, []).append((rel, url, title))
-            have.add(norm(url))
+    for work_dir in work_dirs:
+        for root_key, items in edge_bookmarks(work_dir).items():
+            for url, title, path in items:
+                if norm(url) in have:
+                    continue
+                rel = path if root_key == "synced" else [p for p in path if p not in STRIP_ROOTS]
+                rel = [p for p in rel if p]  # drop the roots' own empty name
+                key = "/".join(rel) or "(top of Work)"
+                added_work.setdefault(key, []).append((rel, url, title))
+                have.add(norm(url))
 
     # --- workspaces → Edge Workspaces folder --------------------------------
+    # Deduped against URLs already under the Edge Workspaces root (re-runs
+    # are no-ops) but deliberately NOT against ordinary bookmark zones:
+    # a workspace tab can also be a regular bookmark.
+    ws_existing: set[str] = set()
+    for ch in top_level(root):
+        if ch.get("Title") == WORKSPACE_ROOT:
+            def _walk_ws(node: dict) -> None:
+                if node.get("WebBookmarkType") == "WebBookmarkTypeLeaf":
+                    if node.get("URLString"):
+                        ws_existing.add(norm(node["URLString"]))
+                else:
+                    for c in node.get("Children", []):
+                        _walk_ws(c)
+            _walk_ws(ch)
     workspaces: list[tuple[str, list]] = []
-    for profile in (a.personal, a.work):
-        workspaces.extend(edge_workspaces(profile))
+    for profile in personal_dirs + work_dirs:
+        for name, items in edge_workspaces(profile):
+            fresh = [(u, t) for u, t, _ in items if norm(u) not in ws_existing]
+            for u, _ in fresh:
+                ws_existing.add(norm(u))
+            if fresh:
+                workspaces.append((name, fresh))
 
     # --- report --------------------------------------------------------------
     n_p = sum(len(v) for v in added_personal.values())
@@ -220,7 +244,7 @@ def main() -> int:
     if n_p == n_w == n_ws == 0:
         print("\nNothing to add.")
         return 0
-    if not a.apply:
+    if not apply:
         print("\nDRY RUN — nothing changed. Re-run with --apply.")
         return 0
 
@@ -237,11 +261,7 @@ def main() -> int:
         ws_children = ensure_path(top_level(root), [WORKSPACE_ROOT])
         for name, items in workspaces:
             ws_folder_children = ensure_path(ws_children, [name])
-            seen: set[str] = set()
-            for url, title, _ in items:
-                if norm(url) in seen:
-                    continue
-                seen.add(norm(url))
+            for url, title in items:
                 ws_folder_children.append(make_leaf(url, title))
 
     backup = f"{PLIST}.sync-{time.strftime('%Y%m%d-%H%M%S')}.bak"
@@ -250,6 +270,15 @@ def main() -> int:
         plistlib.dump(root, f)
     print(f"\n✅ Applied. Backup → {os.path.basename(backup)}")
     return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--personal", required=True, help="Edge profile dir (personal)")
+    ap.add_argument("--work", required=True, help="Edge profile dir (work)")
+    ap.add_argument("--apply", action="store_true")
+    a = ap.parse_args()
+    return run_sync([a.personal], [a.work], a.apply)
 
 
 if __name__ == "__main__":
